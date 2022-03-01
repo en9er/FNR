@@ -6,6 +6,7 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Windows.Input;
@@ -15,24 +16,29 @@ namespace FNR
     enum SearchType { Recursive = 1, NotRecursive}
     internal class MainViewModel : INotifyPropertyChanged
     {
+        private CancellationTokenSource _source = new CancellationTokenSource();
+        private CancellationToken _token;
         FileHandler _fileHandler = new FileHandler();
         public event PropertyChangedEventHandler PropertyChanged;
         public ICommand IBrowseCommand { get; }
         public ICommand IFindCommand { get; }
         public ICommand IReplaceCommand { get; }
+        public ICommand ICancelCommand { get; }
         private string _path = "";
         private bool _searchTypeRecursive = false;
         private ObservableCollection<string> _filenames = new ObservableCollection<string>();
         private string _findText = "";
         private string _replaceText = "";
         private string _selectedFilename = "";
-        private double _progress = 0;
+        private double _progress = 100;
         private ObservableCollection<string> _previewData = new ObservableCollection<string>();
         private string _currentFile;
         private string _mask = "";
         private string[] _excludeMask = new string[10];
         private bool _useMask = false;
         private bool _useExcludeMask = true;
+        private bool _unblockInterface = true;
+        private int _currentfileNum = 0;
         protected virtual void OnPropertyChanged(string propertyName)
         {
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
@@ -100,17 +106,20 @@ namespace FNR
             set
             {
                 _selectedFilename = value;
+                _source = new CancellationTokenSource();
+                _token = _source.Token;
                 Task.Run(() =>
                 {
-                    GetFileData();
-                });
+                    UnblockInterface = false;
+                    GetFileData(_token);
+                }, _token).ContinueWith(x => { UnblockInterface = true; });
                 OnPropertyChanged(nameof(SelectedFilename));
                 OnPropertyChanged(nameof(CurrentFilename));    
             }
         }
-        private void GetFileData()
+        private void GetFileData(CancellationToken token)
         {
-            PreviewFile = _fileHandler.getFileData(SelectedFilename, FindText);
+            PreviewFile = _fileHandler.getFileData(SelectedFilename, FindText, _token);
             OnPropertyChanged(nameof(PreviewFile));
         }
         public ObservableCollection<string> PreviewFile
@@ -143,9 +152,11 @@ namespace FNR
                 if(_filenames != value)
                 {
                     _filenames = value;
+                    _currentfileNum = value.Count;
                 }
                 OnPropertyChanged(nameof(FileNames));
                 OnPropertyChanged(nameof(FilesCount));
+                OnPropertyChanged(nameof(FilesProgress));
             }
         }
         public MainViewModel()
@@ -154,6 +165,7 @@ namespace FNR
             _excludeMask[1] = "*.dll";
             _fileHandler.ProgressChanged += ProgressChanged;
             _fileHandler.FileChanged += FileChanged;
+            _fileHandler.FileNumChanged += FileNumberChanged;
             IBrowseCommand = new RelayCommand<string>(x =>
             {
                 FolderBrowserDialog dialog = new FolderBrowserDialog();
@@ -168,29 +180,55 @@ namespace FNR
 
             IFindCommand = new RelayCommand<string>(x =>
             {
-                if(FindText == "")
+                _source = new CancellationTokenSource();
+                _token = _source.Token;
+                FilePath = _path;
+                Console.WriteLine(Mask);
+                if (FilePath == "")
                 {
-
+                    IBrowseCommand.Execute(null);
                 }
-                else
+                Task.Run(() =>
                 {
-                    if (FilePath == "")
-                    {
-                        IBrowseCommand.Execute(null);
+                    UnblockInterface = false;
+                    if (!String.IsNullOrWhiteSpace(FindText))
+                    {   
+                        FileNames = _fileHandler.findMatches(FindText, FileNames, _token);
                     }
-                    Task.Run(() =>
-                    {
-                        FileNames = _fileHandler.findMatches(FindText, FileNames);
-                        SelectedFilename = SelectedFilename;
-                    });
-                }
+                    SelectedFilename = SelectedFilename;
+                }, _token).ContinueWith(y => {
+                    UnblockInterface = true;
+                    _currentfileNum = FilesCount;
+                    _source = new CancellationTokenSource();
+                    OnPropertyChanged(nameof(FilesProgress));
+                });
             });
 
             IReplaceCommand = new RelayCommand<string>(x =>
             {
-                foreach(string filename in FileNames)
+                _source = new CancellationTokenSource();
+                _token = _source.Token;
+                Task.Run(() =>
                 {
-                    _fileHandler.replaceString(filename, FindText, ReplaceText);
+                    UnblockInterface = false;
+                    foreach (string filename in FileNames)
+                    {
+                        _fileHandler.replaceString(filename, FindText, ReplaceText, _token);
+                    }
+                }, _token).ContinueWith(y => { UnblockInterface = true; });
+            });
+
+            ICancelCommand = new RelayCommand<string>(x =>
+            {
+                if (UnblockInterface == true)
+                {
+                    Console.WriteLine("Interfase is not blocked");
+                    return;
+                }
+                if (_source != null)
+                {
+                    Console.WriteLine("Cancel");
+                    _source.Cancel();
                 }
             });
         }
@@ -219,7 +257,6 @@ namespace FNR
             set
             {
                 _mask = value;
-                FilePath = _path;
                 OnPropertyChanged(nameof(Mask));
             }
         }
@@ -240,7 +277,6 @@ namespace FNR
             {
                 var masks = new ObservableCollection<string>();
                 _excludeMask = value.Replace(" ", "").Split(',');
-                FilePath = _path;
                 OnPropertyChanged(nameof(ExcludeMask));
             }
         }
@@ -255,14 +291,20 @@ namespace FNR
             CurrentFilename = filename;
         }
 
+        private void FileNumberChanged(int num)
+        {
+            CurrentFileNum = num;
+        }
         public double Progress
         {
             get { return Math.Round(_progress); }
             set
             {
                 _progress = value;
-                if(_progress > 100)
+                if(_progress >= 100)
+                {
                     _progress = 100;
+                }
                 OnPropertyChanged(nameof(Progress));
                 OnPropertyChanged(nameof(ProgressPercent));
             }
@@ -278,7 +320,6 @@ namespace FNR
             set
             {
                 _useMask = value;
-                FilePath = _path;
                 OnPropertyChanged(nameof(UseMask));
             }
         }
@@ -289,10 +330,32 @@ namespace FNR
             set
             {
                 _useExcludeMask = value;
-                FilePath = _path;
                 OnPropertyChanged(nameof(UseExcludeMask));
-                OnPropertyChanged(nameof(ExcludeMask));
             }
+        }
+
+        public bool UnblockInterface
+        {
+            get { return _unblockInterface; }
+            set {
+                _unblockInterface = value;
+                OnPropertyChanged(nameof(UnblockInterface));
+            }
+        }
+
+        public int CurrentFileNum
+        {
+            get { return _currentfileNum; }
+            set {
+                _currentfileNum = value;
+                OnPropertyChanged(nameof(CurrentFileNum));
+                OnPropertyChanged(nameof(FilesProgress));
+            }
+        }
+
+        public string FilesProgress
+        {
+            get { return CurrentFileNum.ToString() + " / " + FilesCount; }
         }
     }
 }
